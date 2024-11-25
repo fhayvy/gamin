@@ -190,10 +190,20 @@
 
 ;; Remove asset from marketplace listing
 (define-public (delist-asset (asset-id uint))
-    (let ((listing (unwrap! (map-get? marketplace-listings { asset-id: asset-id }) err-not-found)))
-        (asserts! (is-eq tx-sender (get seller listing)) err-not-authorized)
-        (map-delete marketplace-listings { asset-id: asset-id })
-        (ok true)))
+    (begin
+        ;; Validate asset-id is within the range of minted assets
+        (asserts! (<= asset-id (var-get asset-counter)) err-invalid-input)
+        
+        ;; Try to get the listing, return error if not found
+        (let ((listing (unwrap! (map-get? marketplace-listings { asset-id: asset-id }) err-not-found)))
+            ;; Ensure only the seller can delist
+            (asserts! (is-eq tx-sender (get seller listing)) err-not-authorized)
+            
+            ;; Delete the marketplace listing
+            (map-delete marketplace-listings { asset-id: asset-id })
+            
+            ;; Return success
+            (ok true))))
 
 ;; Update player stats with validation
 (define-public (update-player-stats (experience uint) (level uint))
