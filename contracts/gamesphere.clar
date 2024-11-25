@@ -11,6 +11,7 @@
 (define-constant max-level u100)
 (define-constant max-experience u10000)
 (define-constant max-metadata-length u256)
+(define-constant max-batch-size u10)  ;; Limit batch operations to prevent potential gas issues
 
 ;; Data Variables
 (define-map assets 
@@ -24,6 +25,10 @@
 (define-map player-stats
     { player: principal }
     { experience: uint, level: uint })
+
+(define-map marketplace-listings
+    { asset-id: uint }
+    { seller: principal, price: uint, listed-at: uint })
 
 ;; Asset Counter
 (define-data-var asset-counter uint u0)
@@ -48,7 +53,74 @@
 
 ;; Public Functions
 
-;; Mint new gaming asset
+;; Batch Mint new gaming assets
+(define-public (batch-mint-assets 
+    (metadata-uris (list 10 (string-utf8 256))) 
+    (transferable-list (list 10 bool)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and 
+            (> (len metadata-uris) u0)
+            (<= (len metadata-uris) max-batch-size)
+            (is-eq (len metadata-uris) (len transferable-list))) 
+            err-invalid-input)
+        (let ((minted-assets 
+            (map mint-single-asset 
+                metadata-uris 
+                transferable-list)))
+            (ok minted-assets))))
+
+;; Helper function for batch minting
+(define-private (mint-single-asset 
+    (uri (string-utf8 256))
+    (transferable bool))
+    (let 
+        ((asset-id (+ (var-get asset-counter) u1)))
+        (asserts! (validate-metadata-uri uri) err-invalid-input)
+        (map-set assets
+            { asset-id: asset-id }
+            { owner: contract-owner,
+              metadata-uri: uri,
+              transferable: transferable })
+        (var-set asset-counter asset-id)
+        (ok asset-id)))
+
+;; Batch Transfer assets
+(define-public (batch-transfer-assets 
+    (asset-ids (list 10 uint)) 
+    (recipients (list 10 principal)))
+    (begin
+        (asserts! (and 
+            (> (len asset-ids) u0)
+            (<= (len asset-ids) max-batch-size)
+            (is-eq (len asset-ids) (len recipients))) 
+            err-invalid-input)
+        (let ((transfers 
+            (map transfer-single-asset 
+                asset-ids 
+                recipients)))
+            (ok transfers))))
+
+;; Helper function for batch transfer
+(define-private (transfer-single-asset 
+    (asset-id uint)
+    (recipient principal))
+    (let 
+        ((asset (unwrap-panic (get-asset-checked asset-id))))
+        (asserts! (and
+                (is-eq (get owner asset) tx-sender)
+                (get transferable asset)
+                (not (is-eq recipient tx-sender)))  ;; Prevent self-transfers
+            err-not-authorized)
+        (map-set assets
+            { asset-id: asset-id }
+            { owner: recipient,
+              metadata-uri: (get metadata-uri asset),
+              transferable: (get transferable asset) })
+        (ok true)))  ;; Changed to return (ok true)
+
+
+;; Mint single asset
 (define-public (mint-asset (metadata-uri (string-utf8 256)) (transferable bool))
     (let
         ((asset-id (+ (var-get asset-counter) u1)))
@@ -79,39 +151,49 @@
                   transferable: (get transferable asset) })
             (ok true))))
 
-;; List asset for sale
-(define-public (list-asset (asset-id uint) (price uint))
+;; List asset for sale with enhanced marketplace listing
+(define-public (list-asset-for-sale (asset-id uint) (price uint))
     (begin
         (asserts! (<= asset-id (var-get asset-counter)) err-invalid-input)
         (let ((asset (try! (get-asset-checked asset-id))))
             (asserts! (and 
                     (is-eq (get owner asset) tx-sender)
-                    (> price u0))  ;; Ensure positive price
+                    (> price u0)
+                    (get transferable asset))  ;; Ensure asset is transferable
                 err-invalid-price)
-            (map-set asset-prices
+            (map-set marketplace-listings
                 { asset-id: asset-id }
-                { price: price })
+                { seller: tx-sender, 
+                  price: price, 
+                  listed-at: block-height })
             (ok true))))
 
-;; Purchase listed asset
+;; Purchase listed asset with enhanced marketplace mechanics
 (define-public (purchase-asset (asset-id uint))
     (begin
         (asserts! (<= asset-id (var-get asset-counter)) err-invalid-input)
         (let
             ((asset (try! (get-asset-checked asset-id)))
-             (price-data (unwrap! (map-get? asset-prices { asset-id: asset-id }) err-not-found)))
+             (listing (unwrap! (map-get? marketplace-listings { asset-id: asset-id }) err-not-found)))
             (asserts! (and
-                    (not (is-eq (get owner asset) tx-sender))
+                    (not (is-eq (get seller listing) tx-sender))
                     (get transferable asset))
                 err-not-authorized)
-            (try! (stx-transfer? (get price price-data) tx-sender (get owner asset)))
+            (try! (stx-transfer? (get price listing) tx-sender (get seller listing)))
             (map-set assets
                 { asset-id: asset-id }
                 { owner: tx-sender,
                   metadata-uri: (get metadata-uri asset),
                   transferable: (get transferable asset) })
-            (map-delete asset-prices { asset-id: asset-id })
+            (map-delete marketplace-listings { asset-id: asset-id })
             (ok true))))
+
+;; Remove asset from marketplace listing
+(define-public (delist-asset (asset-id uint))
+    (let ((listing (unwrap! (map-get? marketplace-listings { asset-id: asset-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get seller listing)) err-not-authorized)
+        (map-delete marketplace-listings { asset-id: asset-id })
+        (ok true)))
 
 ;; Update player stats with validation
 (define-public (update-player-stats (experience uint) (level uint))
@@ -131,11 +213,9 @@
         (map-get? assets { asset-id: asset-id })
         none))
 
-;; Get asset price
-(define-read-only (get-asset-price (asset-id uint))
-    (if (<= asset-id (var-get asset-counter))
-        (map-get? asset-prices { asset-id: asset-id })
-        none))
+;; Get marketplace listing details
+(define-read-only (get-marketplace-listing (asset-id uint))
+    (map-get? marketplace-listings { asset-id: asset-id }))
 
 ;; Get player stats
 (define-read-only (get-player-stats (player principal))
